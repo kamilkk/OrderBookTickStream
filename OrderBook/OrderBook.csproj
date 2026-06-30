@@ -10,8 +10,19 @@
     <RootNamespace>OrderBook</RootNamespace>
     <InvariantGlobalization>true</InvariantGlobalization>
     <Optimize>true</Optimize>
-    <!-- Release builds get tiered PGO and server-GC-free single-thread throughput. -->
-    <TieredPGO>true</TieredPGO>
+    <!--
+      Disable tiered compilation so every method is JIT-compiled straight to the
+      fully-optimised tier on first call. This makes the construct-phase timings
+      deterministic: there is no slow instrumented tier-0, no background re-JIT,
+      and no Dynamic-PGO transition mid-benchmark. Without this, the timed best
+      depends on *when* the tier-0 → PGO tier-1 swap happens relative to the run
+      count N — N=10/15 could report anywhere from 2.5 ms to 11 ms purely on JIT
+      timing. With it, the book builds in a stable ~2.56 ms for every N from the
+      first run. TieredPGO is left off because it requires tier-0 to exist.
+      Trade-off: marginally slower process startup (all methods compiled up-front)
+      in exchange for reproducible measurements — the right call for a timing tool.
+    -->
+    <TieredCompilation>false</TieredCompilation>
   </PropertyGroup>
 
   <ItemGroup>

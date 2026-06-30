@@ -85,9 +85,11 @@ timed** — reading and writing are excluded.
    big-endian records into a contiguous `Tick[]` over a `ReadOnlySpan<byte>` with
    `BinaryPrimitives`. Zero per-record allocation.
 2. **Construct** (`BookBuilder` + `OrderBook`) — replay every tick, capturing a
-   `BookSnapshot` per tick. Run **N ∈ [5, 15]** times (default 10) reusing the
-   snapshot buffer and resetting the book between runs; the **best** run is
-   reported, which absorbs JIT/first-touch cost without a separate warm-up.
+   `BookSnapshot` per tick. A short untimed warm-up (3 passes) primes CPU caches
+   and branch predictors, then the loop is run **N ∈ [5, 15]** times (default 10)
+   reusing the snapshot buffer and resetting the book between runs; the **best**
+   run is reported. Because tiered compilation is disabled (see D6), the timed
+   code is fully optimised from the first run, so every N reports the same figure.
 3. **Write** (`ResultWriter`) — stream the result CSV.
 
 ---
@@ -136,6 +138,7 @@ Conventions:
 | D3 | **`int`** for quantity sums | Best-level sums peak at a few hundred in this data; `int` is ample (overflow would need ~7M max-qty orders at one price). |
 | D4 | **Byte-exact output** | `;` separator, CRLF, no BOM, invariant numerics — matches the sample for a clean grader diff. |
 | D5 | **Best-of-N timing, N ∈ [5, 15]** (default 10) | More passes than the original spec called for; report the fastest so the figure reflects warm steady-state rather than a cold JIT pass. |
+| D6 | **Tiered compilation disabled** (`<TieredCompilation>false</TieredCompilation>`) | Makes the timed figure deterministic. With tiering on, the slow band is *instrumented tier-0* (the JIT counting calls/branches to feed Dynamic PGO, ~3–4× slower); the fast band is PGO tier-1. That transition lands mid-benchmark, so the best run becomes a JIT lottery — worst near N = 15, where it varied from 3.4 to 8.5 ms across trials. Disabling tiering compiles straight to the optimised tier on first call: a stable **~2.56 ms for every N**, trading ~15 % off PGO's occasional peak for reproducibility. |
 
 ### Data structures
 
@@ -175,10 +178,24 @@ These were verified by decoding the full 160,429-record file, not assumed blindl
 ## Performance
 
 Construction is **O(T)** over the tick count with tiny constants and no hot-loop
-allocation. On the development machine (a containerised Linux box, single
-thread), the best run measured roughly **0.15 µs/tick** for the full 160,429-tick
-stream (~25 ms total); the cold first pass is several times slower, which is why
-the best-of-N figure is the one reported. Absolute numbers are machine-dependent.
+allocation. On the development machine (Apple Silicon, single thread, .NET 10
+Release), the full 160,429-tick stream builds in a stable **~2.56 ms total
+(≈0.016 µs/tick)** — and, thanks to disabling tiered compilation (D6), that
+figure is reproducible from the first run for every N rather than depending on
+when the JIT happens to re-optimise. Absolute numbers are machine-dependent.
+
+### How the determinism fix was found
+
+The construct phase originally showed wildly different "best" times depending on
+N: ~2.2 ms at N ≥ 20 but anywhere from 3.4 to 11 ms at N ≤ 15. Profiling traced
+this to .NET's tiered JIT — the slow runs were *instrumented tier-0* code
+collecting Dynamic-PGO data (heavily slowed by the instrumentation), and the
+fast runs were the PGO-optimised tier-1 recompilation. The transition fired
+mid-benchmark, around the 39th total pass, so whether the timed window captured
+it was luck. Tuning the warm-up pass count proved fragile and *non-monotonic*
+(30 passes was stable but slower than 25). Disabling tiered compilation removes
+the transition entirely — the JIT emits fully-optimised code up front — yielding
+the stable ~2.56 ms above. Full analysis is in `performance-findings.md`.
 
 ---
 
@@ -190,6 +207,7 @@ the best-of-N figure is the one reported. Absolute numbers are machine-dependent
   reference implementation of the algorithm (0 mismatches).
 - **Invariant check:** across the 157,373 rows in the guaranteed validity window
   that have both sides populated, `B0 < A0` holds with 0 violations.
-- **Unit behaviour:** 14 self-tests covering aggregation, replace/modify/delete
-  semantics, best-level fall-through, clears, the trust-stored-price-on-delete
-  rule, and the range/side guards — all passing.
+- **Unit behaviour:** 18 self-tests covering aggregation, replace/modify/delete
+  semantics, best-level fall-through, clears (including `Y`-action and id-map
+  eviction), the trust-stored-price-on-delete rule, the range/side guards, and
+  the CSV writer's empty/populated-side rendering — all passing.

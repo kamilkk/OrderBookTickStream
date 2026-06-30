@@ -8,11 +8,13 @@ namespace OrderBook.Core;
 /// a <see cref="BookSnapshot"/> per tick, and times only this construction phase.
 /// </summary>
 /// <remarks>
-/// Before the first timed pass, an untimed warm-up runs the full tick loop
-/// <see cref="WarmupRuns"/> times. This reliably triggers .NET Dynamic PGO
-/// re-compilation of all hot methods so that run 1 of the timed section already
-/// executes fully-optimised native code. Without the warm-up, PGO fires around
-/// run 17–18, meaning N ≤ 15 never reaches the true steady-state speed.
+/// Tiered compilation is disabled for this project (see the csproj), so every
+/// hot method is JIT-compiled straight to the fully-optimised tier on first call;
+/// run 1 of the timed section already executes optimal native code. The warm-up
+/// below therefore only primes CPU caches and branch predictors — a few passes
+/// suffice. (Previously, with tiering on, ~25–30 warm-up passes were needed to
+/// drag the JIT through Dynamic PGO before timing, and N ≤ 15 was unstable because
+/// the tier-0 → PGO transition straddled the timed window.)
 ///
 /// The construct phase is then run <c>runs</c> times (the snapshot buffer is reused
 /// and the book is reset between runs); the <b>best</b> run is reported, which
@@ -22,15 +24,13 @@ namespace OrderBook.Core;
 public static class BookBuilder
 {
     /// <summary>
-    /// Untimed passes before the first timed run. 25 passes of 160 k ticks
-    /// (~4 M Apply calls) reliably crosses .NET Dynamic PGO's first re-JIT threshold
-    /// (~2.7 M calls, observed at run 17–18 without a warm-up), so run 1 of the
-    /// timed section starts in the first PGO tier (~7 ms) rather than the cold-JIT
-    /// tier (~18 ms). A second PGO re-JIT fires after ~45 total passes and drives
-    /// the best time to ~2 ms; with N ≥ 20 the timed runs themselves cross that
-    /// threshold without needing extra warm-up passes.
+    /// Untimed passes before the first timed run. With tiered compilation disabled
+    /// the code is already fully optimised on run 1, so these passes serve only to
+    /// warm CPU caches and branch predictors; 3 is ample. (The book's working set —
+    /// two 64 KB ladders plus the order dictionary — is brought resident and the
+    /// hot branches are exercised before the stopwatch starts.)
     /// </summary>
-    private const int WarmupRuns = 25;
+    private const int WarmupRuns = 3;
 
     /// <summary>Builds all per-tick snapshots and prints per-run and best timings.</summary>
     /// <param name="ticks">Decoded input stream.</param>
@@ -45,9 +45,10 @@ public static class BookBuilder
         var book      = new OrderBook();
 
         // --- untimed warm-up ---
-        // Run the full tick loop WarmupRuns times to trigger .NET Dynamic PGO
-        // before the first stopwatch starts. The snapshot buffer is reused so
-        // no extra allocation occurs; results are overwritten by the timed runs.
+        // Run the full tick loop WarmupRuns times to bring the book's working set
+        // resident and warm the branch predictors before the first stopwatch starts.
+        // The snapshot buffer is reused so no extra allocation occurs; results are
+        // overwritten by the timed runs.
         for (int w = 0; w < WarmupRuns; w++)
         {
             book.Reset();
@@ -61,7 +62,7 @@ public static class BookBuilder
         // --- timed runs ---
         Console.WriteLine(
             $"Constructing ({ticks.Length:N0} ticks, {runs} run(s), " +
-            $"after {WarmupRuns}-pass PGO warm-up):");
+            $"after {WarmupRuns}-pass cache warm-up):");
 
         TimeSpan best = TimeSpan.MaxValue;
 
