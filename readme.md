@@ -138,23 +138,29 @@ Conventions:
 | D3 | **`int`** for quantity sums | Best-level sums peak at a few hundred in this data; `int` is ample (overflow would need ~7M max-qty orders at one price). |
 | D4 | **Byte-exact output** | `;` separator, CRLF, no BOM, invariant numerics — matches the sample for a clean grader diff. |
 | D5 | **Best-of-N timing, N ∈ [5, 15]** (default 10) | More passes than the original spec called for; report the fastest so the figure reflects warm steady-state rather than a cold JIT pass. |
-| D6 | **Tiered compilation disabled** (`<TieredCompilation>false</TieredCompilation>`) | Makes the timed figure deterministic. With tiering on, the slow band is *instrumented tier-0* (the JIT counting calls/branches to feed Dynamic PGO, ~3–4× slower); the fast band is PGO tier-1. That transition lands mid-benchmark, so the best run becomes a JIT lottery — worst near N = 15, where it varied from 3.4 to 8.5 ms across trials. Disabling tiering compiles straight to the optimised tier on first call: a stable **~2.56 ms for every N**, trading ~15 % off PGO's occasional peak for reproducibility. |
+| D6 | **Tiered compilation disabled** (`<TieredCompilation>false</TieredCompilation>`) | Makes the timed figure deterministic. With tiering on, the slow band is *instrumented tier-0* (the JIT counting calls/branches to feed Dynamic PGO, ~3–4× slower); the fast band is PGO tier-1. That transition lands mid-benchmark, so the best run becomes a JIT lottery — worst near N = 15, where it varied from 3.4 to 8.5 ms across trials. Disabling tiering compiles straight to the optimised tier on first call: a stable best for every N (≈2.2 ms after the §8 tuning), trading ~15 % off PGO's occasional peak for reproducibility. |
 
 ### Data structures
 
 **Per side** (`OrderBook.Ladder`):
-- `int[16384] qty` and `int[16384] count`, indexed directly by price.
+- one `Level[16384]` array (each `Level` is `{ int Qty; int Count; }`), indexed
+  directly by price — qty and count share a cache line per level touch.
 - a single best cursor (`-1` = empty): highest populated index for BID, lowest
-  for ASK.
+  for ASK; the best level's qty/count are also cached as scalars so the per-tick
+  snapshot read needs no array indexing.
 - Add/modify/delete are O(1); the cursor is only walked to the next populated
   level when the current best empties. Clear is skipped entirely when the side is
-  already empty.
+  already empty, and otherwise zeroes only the touched price band.
 
-**Order index** (`Dictionary<long, OrderEntry>`): maps `OrderId →
-(side, price, qty)` so modifies/deletes can locate an order's level. Sized to
-2048, comfortably above the observed peak of ~1,150 concurrent live orders, so
-the hot loop never rehashes. The **delete record's own price is never trusted** —
-the stored price is authoritative.
+**Order index** (`OrderMap`): a structure-of-arrays open-addressing hash table
+(dense `long[]` keys + parallel `OrderEntry[]` values) mapping `OrderId →
+(side, price, qty)` so modifies/deletes can locate an order's level. Fixed at 4096
+slots (power of two) against a ~1,150 peak of concurrent live orders (~28 % load);
+a Fibonacci-hash probe finds or inserts in one pass and returns a `ref` into the
+value slot, and deletion uses backward-shift compaction (no tombstones). This
+replaces `Dictionary<long, OrderEntry>` — the order lookup is the hot path's
+largest cost, and the flat SoA layout shaves the dictionary's bucket→entry hop.
+The **delete record's own price is never trusted** — the stored price is authoritative.
 
 A price outside `[0, 16383]` is a hard, fail-fast error rather than silent
 corruption; if a future instrument widened the range, the fix is a one-line
@@ -179,10 +185,43 @@ These were verified by decoding the full 160,429-record file, not assumed blindl
 
 Construction is **O(T)** over the tick count with tiny constants and no hot-loop
 allocation. On the development machine (Apple Silicon, single thread, .NET 10
-Release), the full 160,429-tick stream builds in a stable **~2.56 ms total
-(≈0.016 µs/tick)** — and, thanks to disabling tiered compilation (D6), that
+Release), the full 160,429-tick stream builds in a stable **~2.2 ms total
+(≈0.0135 µs/tick)** — and, thanks to disabling tiered compilation (D6), that
 figure is reproducible from the first run for every N rather than depending on
 when the JIT happens to re-optimise. Absolute numbers are machine-dependent.
+
+The hot path was tuned by **ablation** (removing pieces of the timed loop to
+attribute cost). The order-by-id lookup is the single largest cost and is
+memory-latency bound, so it uses a structure-of-arrays open-addressing map
+(`OrderMap`); the best level's qty/count are cached as scalars so the per-tick
+snapshot needs no array indexing; and the ladder keeps qty+count in one `Level[]`
+so each level touch hits a single cache line. The remaining floor is the map's
+cache-miss latency plus the mandatory per-tick snapshot — see
+`performance-findings.md` §8 for the full breakdown and why ~0.0135 µs/tick is the
+practical floor for this design on this hardware.
+
+### Order-lookup latency and the x86 prefetch hook
+
+That "memory-latency bound" claim was **verified**, not assumed: a stride-padding
+experiment (`performance-findings.md` §9) held the map's computation constant while
+spreading its 4096 slots over more cache lines, and the timed best rose +53 %
+(2.26 → 3.46 ms) monotonically with footprint — the signature of a lookup that
+stalls on memory, not compute.
+
+Because the per-tick lookups are independent, that latency can be overlapped by
+prefetching the *next* tick's map slot while the current tick is processed.
+`OrderBook.Prefetch(orderId)` issues an `Sse.Prefetch0` (T0) hint, and the timed
+loop calls it `PrefetchDistance` ticks ahead. It is a **pure hint** — output is
+byte-identical with or without it — and it is gated on `OrderBook.PrefetchSupported`
+(`Sse.IsSupported`, a JIT-folded constant), so on **non-x86 (e.g. this Apple Silicon
+dev machine) the entire block, bounds check included, is eliminated** and timings are
+unchanged. `<AllowUnsafeBlocks>` is enabled solely for the intrinsic's `void*`.
+
+The hook is wired and verified compiled-out on ARM, but the *speedup* can only be
+measured on x86 (`Sse.Prefetch0` has no portable ARM equivalent — shipping it on ARM
+would need a native `PRFM` stub). To evaluate on x86: sweep `PrefetchDistance` (2–6)
+and A/B against a build with the call removed, on the same pinned core, confirming the
+output stays byte-identical.
 
 ### How the determinism fix was found
 
@@ -194,8 +233,9 @@ fast runs were the PGO-optimised tier-1 recompilation. The transition fired
 mid-benchmark, around the 39th total pass, so whether the timed window captured
 it was luck. Tuning the warm-up pass count proved fragile and *non-monotonic*
 (30 passes was stable but slower than 25). Disabling tiered compilation removes
-the transition entirely — the JIT emits fully-optimised code up front — yielding
-the stable ~2.56 ms above. Full analysis is in `performance-findings.md`.
+the transition entirely — the JIT emits fully-optimised code up front — giving a
+stable best for every N (~2.56 ms at the time, ~2.2 ms after the later hot-path
+tuning). Full analysis is in `performance-findings.md`.
 
 ---
 

@@ -10,6 +10,8 @@
     <RootNamespace>OrderBook</RootNamespace>
     <InvariantGlobalization>true</InvariantGlobalization>
     <Optimize>true</Optimize>
+    <!-- Needed for the x86 Sse.Prefetch0 hint in OrderMap (takes a void*). -->
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <!--
       Disable tiered compilation so every method is JIT-compiled straight to the
       fully-optimised tier on first call. This makes the construct-phase timings

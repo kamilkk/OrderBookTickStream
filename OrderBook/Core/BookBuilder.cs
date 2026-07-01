@@ -32,6 +32,15 @@ public static class BookBuilder
     /// </summary>
     private const int WarmupRuns = 3;
 
+    /// <summary>
+    /// How many ticks ahead to prefetch the order-map slot (see
+    /// <see cref="OrderBook.Prefetch"/>). The lookup is memory-latency bound, so the
+    /// hint must lead the matching <c>Apply</c> by enough work to hide a cache miss.
+    /// Effective only on x86; folded away entirely elsewhere. The best value is
+    /// hardware-specific and should be swept (2–6) when tuning on real x86 silicon.
+    /// </summary>
+    private const int PrefetchDistance = 3;
+
     /// <summary>Builds all per-tick snapshots and prints per-run and best timings.</summary>
     /// <param name="ticks">Decoded input stream.</param>
     /// <param name="runs">Number of timed construction passes (best is reported).</param>
@@ -54,6 +63,15 @@ public static class BookBuilder
             book.Reset();
             for (int i = 0; i < ticks.Length; i++)
             {
+                // Prefetch a few ticks ahead so the order-map miss is in flight before
+                // Apply needs it. Gated on PrefetchSupported (a JIT constant), so on
+                // non-x86 the whole block — bounds check and all — is eliminated.
+                if (OrderBook.PrefetchSupported)
+                {
+                    int p = i + PrefetchDistance;
+                    if (p < ticks.Length) book.Prefetch(ticks[p].OrderId);
+                }
+
                 book.Apply(in ticks[i]);
                 snapshots[i] = book.Snapshot();
             }
@@ -73,6 +91,15 @@ public static class BookBuilder
             var sw = Stopwatch.StartNew();
             for (int i = 0; i < ticks.Length; i++)
             {
+                // Prefetch a few ticks ahead so the order-map miss is in flight before
+                // Apply needs it. Gated on PrefetchSupported (a JIT constant), so on
+                // non-x86 the whole block — bounds check and all — is eliminated.
+                if (OrderBook.PrefetchSupported)
+                {
+                    int p = i + PrefetchDistance;
+                    if (p < ticks.Length) book.Prefetch(ticks[p].OrderId);
+                }
+
                 book.Apply(in ticks[i]);
                 snapshots[i] = book.Snapshot();
             }
