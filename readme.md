@@ -1,4 +1,4 @@
-# Order Book — Tick Stream Reconstruction
+# Order Book - Tick Stream Reconstruction
 
 A standalone **.NET 10** console application that reads the binary tick stream
 `ticks.raw`, reconstructs the limit order book tick-by-tick, computes the
@@ -41,7 +41,7 @@ dotnet run --project OrderBook -c Release -- <input.raw> <output.csv> <runs>
 
 - `input.raw` — path to the binary input (default: bundled `ticks.raw`)
 - `output.csv` — output path (default: `ticks_result.csv` next to the exe)
-- `runs` — number of timed construct passes, clamped to **[5, 15]** (default: 10)
+- `runs` — number of timed construct passes, clamped to **[5, 50]** (default: 15)
 
 ### Run the tests
 
