@@ -16,9 +16,9 @@ internal static class Program
 
     // Timing runs are kept in the small [5, 15] band: enough to discard a cold pass,
     // few enough to stay quick.
-    private const int DefaultRuns = 10;
+    private const int DefaultRuns = 15;
     private const int MinRuns = 5;
-    private const int MaxRuns = 15;
+    private const int MaxRuns = 50;
 
     private static int Main(string[] args)
     {

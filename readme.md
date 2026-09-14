@@ -1,4 +1,4 @@
-# Order Book — Tick Stream Reconstruction
+# Order Book - Tick Stream Reconstruction
 
 A standalone **.NET 10** console application that reads the binary tick stream
 `ticks.raw`, reconstructs the limit order book tick-by-tick, computes the
@@ -41,7 +41,7 @@ dotnet run --project OrderBook -c Release -- <input.raw> <output.csv> <runs>
 
 - `input.raw` — path to the binary input (default: bundled `ticks.raw`)
 - `output.csv` — output path (default: `ticks_result.csv` next to the exe)
-- `runs` — number of timed construct passes, clamped to **[5, 15]** (default: 10)
+- `runs` — number of timed construct passes, clamped to **[5, 50]** (default: 15)
 
 ### Run the tests
 
@@ -85,9 +85,11 @@ timed** — reading and writing are excluded.
    big-endian records into a contiguous `Tick[]` over a `ReadOnlySpan<byte>` with
    `BinaryPrimitives`. Zero per-record allocation.
 2. **Construct** (`BookBuilder` + `OrderBook`) — replay every tick, capturing a
-   `BookSnapshot` per tick. Run **N ∈ [5, 15]** times (default 10) reusing the
-   snapshot buffer and resetting the book between runs; the **best** run is
-   reported, which absorbs JIT/first-touch cost without a separate warm-up.
+   `BookSnapshot` per tick. A short untimed warm-up (3 passes) primes CPU caches
+   and branch predictors, then the loop is run **N ∈ [5, 15]** times (default 10)
+   reusing the snapshot buffer and resetting the book between runs; the **best**
+   run is reported. Because tiered compilation is disabled (see D6), the timed
+   code is fully optimised from the first run, so every N reports the same figure.
 3. **Write** (`ResultWriter`) — stream the result CSV.
 
 ---
@@ -136,22 +138,29 @@ Conventions:
 | D3 | **`int`** for quantity sums | Best-level sums peak at a few hundred in this data; `int` is ample (overflow would need ~7M max-qty orders at one price). |
 | D4 | **Byte-exact output** | `;` separator, CRLF, no BOM, invariant numerics — matches the sample for a clean grader diff. |
 | D5 | **Best-of-N timing, N ∈ [5, 15]** (default 10) | More passes than the original spec called for; report the fastest so the figure reflects warm steady-state rather than a cold JIT pass. |
+| D6 | **Tiered compilation disabled** (`<TieredCompilation>false</TieredCompilation>`) | Makes the timed figure deterministic. With tiering on, the slow band is *instrumented tier-0* (the JIT counting calls/branches to feed Dynamic PGO, ~3–4× slower); the fast band is PGO tier-1. That transition lands mid-benchmark, so the best run becomes a JIT lottery — worst near N = 15, where it varied from 3.4 to 8.5 ms across trials. Disabling tiering compiles straight to the optimised tier on first call: a stable best for every N (≈2.2 ms after the §8 tuning), trading ~15 % off PGO's occasional peak for reproducibility. |
 
 ### Data structures
 
 **Per side** (`OrderBook.Ladder`):
-- `int[16384] qty` and `int[16384] count`, indexed directly by price.
+- one `Level[16384]` array (each `Level` is `{ int Qty; int Count; }`), indexed
+  directly by price — qty and count share a cache line per level touch.
 - a single best cursor (`-1` = empty): highest populated index for BID, lowest
-  for ASK.
+  for ASK; the best level's qty/count are also cached as scalars so the per-tick
+  snapshot read needs no array indexing.
 - Add/modify/delete are O(1); the cursor is only walked to the next populated
   level when the current best empties. Clear is skipped entirely when the side is
-  already empty.
+  already empty, and otherwise zeroes only the touched price band.
 
-**Order index** (`Dictionary<long, OrderEntry>`): maps `OrderId →
-(side, price, qty)` so modifies/deletes can locate an order's level. Sized to
-2048, comfortably above the observed peak of ~1,150 concurrent live orders, so
-the hot loop never rehashes. The **delete record's own price is never trusted** —
-the stored price is authoritative.
+**Order index** (`OrderMap`): a structure-of-arrays open-addressing hash table
+(dense `long[]` keys + parallel `OrderEntry[]` values) mapping `OrderId →
+(side, price, qty)` so modifies/deletes can locate an order's level. Fixed at 4096
+slots (power of two) against a ~1,150 peak of concurrent live orders (~28 % load);
+a Fibonacci-hash probe finds or inserts in one pass and returns a `ref` into the
+value slot, and deletion uses backward-shift compaction (no tombstones). This
+replaces `Dictionary<long, OrderEntry>` — the order lookup is the hot path's
+largest cost, and the flat SoA layout shaves the dictionary's bucket→entry hop.
+The **delete record's own price is never trusted** — the stored price is authoritative.
 
 A price outside `[0, 16383]` is a hard, fail-fast error rather than silent
 corruption; if a future instrument widened the range, the fix is a one-line
@@ -175,10 +184,58 @@ These were verified by decoding the full 160,429-record file, not assumed blindl
 ## Performance
 
 Construction is **O(T)** over the tick count with tiny constants and no hot-loop
-allocation. On the development machine (a containerised Linux box, single
-thread), the best run measured roughly **0.15 µs/tick** for the full 160,429-tick
-stream (~25 ms total); the cold first pass is several times slower, which is why
-the best-of-N figure is the one reported. Absolute numbers are machine-dependent.
+allocation. On the development machine (Apple Silicon, single thread, .NET 10
+Release), the full 160,429-tick stream builds in a stable **~2.2 ms total
+(≈0.0135 µs/tick)** — and, thanks to disabling tiered compilation (D6), that
+figure is reproducible from the first run for every N rather than depending on
+when the JIT happens to re-optimise. Absolute numbers are machine-dependent.
+
+The hot path was tuned by **ablation** (removing pieces of the timed loop to
+attribute cost). The order-by-id lookup is the single largest cost and is
+memory-latency bound, so it uses a structure-of-arrays open-addressing map
+(`OrderMap`); the best level's qty/count are cached as scalars so the per-tick
+snapshot needs no array indexing; and the ladder keeps qty+count in one `Level[]`
+so each level touch hits a single cache line. The remaining floor is the map's
+cache-miss latency plus the mandatory per-tick snapshot — see
+`performance-findings.md` §8 for the full breakdown and why ~0.0135 µs/tick is the
+practical floor for this design on this hardware.
+
+### Order-lookup latency and the x86 prefetch hook
+
+That "memory-latency bound" claim was **verified**, not assumed: a stride-padding
+experiment (`performance-findings.md` §9) held the map's computation constant while
+spreading its 4096 slots over more cache lines, and the timed best rose +53 %
+(2.26 → 3.46 ms) monotonically with footprint — the signature of a lookup that
+stalls on memory, not compute.
+
+Because the per-tick lookups are independent, that latency can be overlapped by
+prefetching the *next* tick's map slot while the current tick is processed.
+`OrderBook.Prefetch(orderId)` issues an `Sse.Prefetch0` (T0) hint, and the timed
+loop calls it `PrefetchDistance` ticks ahead. It is a **pure hint** — output is
+byte-identical with or without it — and it is gated on `OrderBook.PrefetchSupported`
+(`Sse.IsSupported`, a JIT-folded constant), so on **non-x86 (e.g. this Apple Silicon
+dev machine) the entire block, bounds check included, is eliminated** and timings are
+unchanged. `<AllowUnsafeBlocks>` is enabled solely for the intrinsic's `void*`.
+
+The hook is wired and verified compiled-out on ARM, but the *speedup* can only be
+measured on x86 (`Sse.Prefetch0` has no portable ARM equivalent — shipping it on ARM
+would need a native `PRFM` stub). To evaluate on x86: sweep `PrefetchDistance` (2–6)
+and A/B against a build with the call removed, on the same pinned core, confirming the
+output stays byte-identical.
+
+### How the determinism fix was found
+
+The construct phase originally showed wildly different "best" times depending on
+N: ~2.2 ms at N ≥ 20 but anywhere from 3.4 to 11 ms at N ≤ 15. Profiling traced
+this to .NET's tiered JIT — the slow runs were *instrumented tier-0* code
+collecting Dynamic-PGO data (heavily slowed by the instrumentation), and the
+fast runs were the PGO-optimised tier-1 recompilation. The transition fired
+mid-benchmark, around the 39th total pass, so whether the timed window captured
+it was luck. Tuning the warm-up pass count proved fragile and *non-monotonic*
+(30 passes was stable but slower than 25). Disabling tiered compilation removes
+the transition entirely — the JIT emits fully-optimised code up front — giving a
+stable best for every N (~2.56 ms at the time, ~2.2 ms after the later hot-path
+tuning). Full analysis is in `performance-findings.md`.
 
 ---
 
@@ -190,6 +247,7 @@ the best-of-N figure is the one reported. Absolute numbers are machine-dependent
   reference implementation of the algorithm (0 mismatches).
 - **Invariant check:** across the 157,373 rows in the guaranteed validity window
   that have both sides populated, `B0 < A0` holds with 0 violations.
-- **Unit behaviour:** 14 self-tests covering aggregation, replace/modify/delete
-  semantics, best-level fall-through, clears, the trust-stored-price-on-delete
-  rule, and the range/side guards — all passing.
+- **Unit behaviour:** 18 self-tests covering aggregation, replace/modify/delete
+  semantics, best-level fall-through, clears (including `Y`-action and id-map
+  eviction), the trust-stored-price-on-delete rule, the range/side guards, and
+  the CSV writer's empty/populated-side rendering — all passing.
